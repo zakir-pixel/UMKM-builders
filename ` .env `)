@@ -1,0 +1,8 @@
+# Konfigurasi Midtrans (ambil dari dashboard Midtrans Anda)
+MIDTRANS_SERVER_KEY=SB-Mid-server-IfHkecFTC4LrrsEMs4prOnWX
+MIDTRANS_CLIENT_KEY=SB-Mid-client-HXvjKcQDNoLDDBNo
+
+# MongoDB Atlas
+mongodb+srv://Zumkmuser:<db_password>@umkm.fwtzjhv.mongodb.net/?appName=UMKM
+
+PORT=3000
