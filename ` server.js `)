@@ -1,0 +1,371 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const Midtrans = require('midtrans-client');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+app.use(express.static('public'));
+
+// ====================
+// KONFIGURASI MIDTRANS
+// ====================
+let snap = new Midtrans.Snap({
+    isProduction: false, // true kalau sudah produksi
+    serverKey: process.env.MIDTRANS_SERVER_KEY,
+    clientKey: process.env.MIDTRANS_CLIENT_KEY
+});
+
+// ====================
+// DATABASE (MongoDB)
+// ====================
+mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/umkm-builder')
+    .then(() => console.log('Terhubung ke MongoDB'))
+    .catch(err => console.log('MongoDB error (gunakan Atlas):', err));
+
+// Schema Pesanan
+const OrderSchema = new mongoose.Schema({
+    businessName: String,
+    ownerName: String,
+    email: String,
+    phone: String,
+    package: String,
+    price: Number,
+    color: String,
+    subdomain: String,
+    status: { type: String, default: 'pending' },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const Order = mongoose.model('Order', OrderSchema);
+
+// ====================
+// FOLDER PUBLIC
+// ====================
+if (!fs.existsSync('public')) {
+    fs.mkdirSync('public');
+}
+
+// ====================
+// API - HALAMAN DEPAN
+// ====================
+app.get('/', (req, res) => {
+    res.sendFile(__dirname + '/public/index.html');
+});
+
+// ====================
+// API - BUAT PESANAN
+// ====================
+app.post('/api/create-order', async (req, res) => {
+    try {
+        const { businessName, ownerName, email, phone, package: pkg, price, color } = req.body;
+        
+        // Buat subdomain unik
+        const slug = businessName.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 20);
+        const subdomain = `${slug}-${Date.now()}`;
+        
+        // Simpan ke database
+        const order = new Order({
+            businessName,
+            ownerName,
+            email,
+            phone,
+            package: pkg,
+            price,
+            color,
+            subdomain
+        });
+        await order.save();
+        
+        // Buat transaksi Midtrans
+        let parameter = {
+            transaction_details: {
+                order_id: 'ORDER-' + order._id,
+                gross_amount: price
+            },
+            customer_details: {
+                first_name: ownerName,
+                email: email,
+                phone: phone
+            },
+            item_details: [
+                {
+                    id: pkg,
+                    name: 'Paket ' + pkg,
+                    price: price,
+                    quantity: 1
+                }
+            ]
+        };
+        
+        const snapToken = await snap.createTransaction(parameter);
+        
+        res.json({ 
+            success: true, 
+            orderId: order._id.toString(),
+            snapToken: snapToken.token 
+        });
+        
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ====================
+// API - CALLBACK DARI MIDTRANS
+// ====================
+app.post('/api/midtrans-notification', async (req, res) => {
+    try {
+        const notification = req.body;
+        const orderId = notification.order_id;
+        
+        // Update status jika berhasil
+        if (notification.transaction_status === 'settlement' || 
+            notification.transaction_status === 'capture') {
+            
+            // Ambil IDpesanan dari order_id
+            const actualId = orderId.replace('ORDER-', '');
+            
+            await Order.findByIdAndUpdate(actualId, { 
+                status: 'paid'
+            });
+            
+            // Buat website untuk pelanggan
+            await createWebsite(actualId);
+        }
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ====================
+// FUNGSI - BUAT WEBSITE PELANGGAN
+// ====================
+async function createWebsite(orderId) {
+    try {
+        const order = await Order.findById(orderId);
+        if (!order) return;
+        
+        // Buat folder untuk website pelanggan
+        const websiteDir = path.join(__dirname, 'public', 'websites', order.subdomain);
+        if (!fs.existsSync(websiteDir)) {
+            fs.mkdirSync(websiteDir, { recursive: true });
+        }
+        
+        // Buat file HTML website
+        const websiteHTML = generateTemplate(order);
+        fs.writeFileSync(path.join(websiteDir, 'index.html'), websiteHTML);
+        
+        console.log(`✅ Website dibuat untuk ${order.businessName}: ${order.subdomain}`);
+        
+    } catch (error) {
+        console.error('Error buat website:', error);
+    }
+}
+
+// ====================
+// TEMPLATE WEBSITE
+// ====================
+function generateTemplate(order) {
+    const phoneWA = order.phone.replace(/[^0-9]/g, '');
+    
+    return `<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${order.businessName}</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root { --primary: ${order.color}; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; line-height: 1.6; }
+        
+        header {
+            background: var(--primary);
+            color: white;
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .hero {
+            background: linear-gradient(rgba(0,0,0,0.5), rgba(0,0,0,0.5)), url('https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?w=800');
+            background-size: cover;
+            background-position: center;
+            color: white;
+            padding: 4rem 1rem;
+            text-align: center;
+        }
+        
+        .hero h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+        
+        .products {
+            padding: 2rem 1rem;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        .products h2 { text-align: center; margin-bottom: 2rem; color: #333; }
+        
+        .product-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+        }
+        
+        .product-card {
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            overflow: hidden;
+            transition: 0.3s;
+        }
+        
+        .product-card:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.1); }
+        
+        .product-img {
+            width: 100%;
+            height: 200px;
+            background: #eee;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 3rem;
+            color: #aaa;
+        }
+        
+        .product-info { padding: 1rem; }
+        .product-info h3 { margin-bottom: 0.5rem; }
+        .product-info .price { color: var(--primary); font-weight: bold; font-size: 1.2rem; }
+        
+        .btn-wa {
+            display: inline-block;
+            background: #25D366;
+            color: white;
+            padding: 0.7rem 1.5rem;
+            text-decoration: none;
+            border-radius: 25px;
+            margin-top: 1rem;
+            font-weight: bold;
+        }
+        
+        .contact {
+            background: #f5f5f5;
+            padding: 3rem 1rem;
+            text-align: center;
+        }
+        
+        footer {
+            background: #333;
+            color: white;
+            padding: 2rem 1rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h2>${order.businessName}</h2>
+        <a href="https://wa.me/${phoneWA}" style="color: white; text-decoration: none;">
+            <i class="fab fa-whatsapp"></i> Hubungi Kami
+        </a>
+    </header>
+    
+    <section class="hero">
+        <h1>Selamat Datang di ${order.businessName}</h1>
+        <p>Kualitas terbaik untuk Anda</p>
+    </section>
+    
+    <section class="products">
+        <h2>Produk Kami</h2>
+        <div class="product-grid">
+            <div class="product-card">
+                <div class="product-img">
+                    <i class="fas fa-box"></i>
+                </div>
+                <div class="product-info">
+                    <h3>Produk Unggulan</h3>
+                    <p>Deskripsi produk andalan Anda</p>
+                    <div class="price">Rp 50.000</div>
+                    <a href="https://wa.me/${phoneWA}?text=Halo, saya tertarik dengan Produk Unggulan" class="btn-wa">
+                        <i class="fab fa-whatsapp"></i> Pesan Sekarang
+                    </a>
+                </div>
+            </div>
+            
+            <div class="product-card">
+                <div class="product-img">
+                    <i class="fas fa-box"></i>
+                </div>
+                <div class="product-info">
+                    <h3>Produk Populer</h3>
+                    <p>Produk favorit pelanggan</p>
+                    <div class="price">Rp 75.000</div>
+                    <a href="https://wa.me/${phoneWA}?text=Halo, saya tertarik dengan Produk Populer" class="btn-wa">
+                        <i class="fab fa-whatsapp"></i> Pesan Sekarang
+                    </a>
+                </div>
+            </div>
+            
+            <div class="product-card">
+                <div class="product-img">
+                    <i class="fas fa-box"></i>
+                </div>
+                <div class="product-info">
+                    <h3>Paket Hemat</h3>
+                    <p>Bundle produk pilihan</p>
+                    <div class="price">Rp 120.000</div>
+                    <a href="https://wa.me/${phoneWA}?text=Halo, saya tertarik dengan Paket Hemat" class="btn-wa">
+                        <i class="fab fa-whatsapp"></i> Pesan Sekarang
+                    </a>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <section class="contact">
+        <h2>Hubungi Kami</h2>
+        <p>${order.businessName}</p>
+        <p>${order.phone} | ${order.email}</p>
+        <br>
+        <a href="https://wa.me/${phoneWA}" class="btn-wa" style="background: #25D366;">
+            <i class="fab fa-whatsapp"></i> Chat WhatsApp
+        </a>
+    </section>
+    
+    <footer>
+        <p>&copy; 2024 ${order.businessName}. All rights reserved.</p>
+    </footer>
+</body>
+</html>`;
+}
+
+// ====================
+// API - LIHAT WEBSITE PELANGGAN
+// ====================
+app.get('/website/:subdomain', (req, res) => {
+    const subdomain = req.params.subdomain;
+    const filePath = path.join(__dirname, 'public', 'websites', subdomain, 'index.html');
+    
+    if (fs.existsSync(filePath)) {
+        res.sendFile(filePath);
+    } else {
+        res.send('Website tidak ditemukan');
+    }
+});
+
+// ====================
+// START SERVER
+// ====================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`
